@@ -12,6 +12,10 @@ import numpy as np
 import os
 import argparse
 
+import tqdm
+from sandbox.read_mesh import read_obj_to_tensor
+from glob import glob
+from pathlib import Path
 import yaml
 import pickle 
 import logging 
@@ -69,6 +73,58 @@ def driven_by_face(model, src_pth, drv_pth, out_pth, device, softmask=True):
         predict_img.save(out_pth)
 
 
+# def audio_driven_flame(model, src_pth, out_pth, device, params_path, softmask=False):
+    """
+    Drive source image based on flame params from emote
+    default frontal pose, change by passing pose
+    """
+#     # face landmark detector
+#     fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device=device)
+#     src_img, src_img_crop, src_tform = preprocess_image(src_pth, fa, device)
+    
+#     with open(params_path, 'rb') as f:
+#         coeffs_dict = pickle.load(f)
+#         assert type(coeffs_dict) == dict, f"Expect class:dict loaded from .pkl file, got {type(coeffs_dict)}"
+    
+    
+def driven_by_mesh(model, src_pth, imgs_out_dir, expname, mesh_dir, device, softmask=False):
+
+    os.makedirs(os.path.join(imgs_out_dir, expname))
+    # face landmark detector
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device=device)
+    src_img, src_img_crop, src_tform = preprocess_image(src_pth, fa, device)
+    
+    # metadata for: (to avoid estimate deca again for every loop)
+    # generate_from_mesh(src_img, src_tform, src_verts, src_codedict, src_mask, drv_verts, hair_deform=True, pose=None)
+    src_verts, src_codedict, src_mask = model.get_mesh_metadata(src_img_crop, src_img)
+    
+    # read mesh from mesh folder
+    mesh_paths = sorted(glob(mesh_dir + '/*.obj'))
+
+    with torch.no_grad():
+        for path in tqdm.tqdm(mesh_paths):
+            filename = Path(path).stem
+            verts = read_obj_to_tensor(path).to(device)
+            outputs = model.generate_from_mesh(src_img, src_tform, src_verts, src_codedict, src_mask, verts)
+            predict_img = outputs["pred_drv_img"]   # (1,3,256,256), tensor, val:[-1,1]
+            predict_mask = outputs["pred_drv_mask"] # (1,256,256), tensor, val:[0, 1], soft mask
+
+            # visualize
+            predict_img = 0.5 * (predict_img + 1)
+            predict_img = predict_img[0].permute(1,2,0).cpu().numpy()   # (256,256,3), npy  
+            predict_mask = predict_mask[0].permute(1,2,0).cpu().numpy()   # (256,256,1), npy
+            if not softmask:
+                predict_mask = (predict_mask > 0.6) + 0.0     # (256,256,1), npy
+
+            # apply mask
+            predict_img = predict_img * predict_mask + (1 - predict_mask)  # apply mask to predicted image, val:[0, 1], npy
+            predict_img = (predict_img * 255).astype(np.uint8)
+            predict_img = Image.fromarray(predict_img)
+            predict_img.save(os.path.join(imgs_out_dir, expname, filename + '.jpg'))            
+            
+            # frames.append(predict_img)
+    # return frames
+
 def driven_by_flame_coefs(model, src_pth, out_pth, device, softmask=False):
     # face landmark detector
     fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device=device)
@@ -102,8 +158,9 @@ def driven_by_flame_coefs(model, src_pth, out_pth, device, softmask=False):
             # predict_img.save("examples/shape_{}.png".format(i))
         frame_one = frames[0]
         
+        os.makedirs(out_pth, exist_ok=True)
         out_name = os.path.join(out_pth, "shape.gif")
-        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=200, loop=0) 
+        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=500, loop=0) 
 
         # ######################### exp ###############################
         frames = []
@@ -129,7 +186,7 @@ def driven_by_flame_coefs(model, src_pth, out_pth, device, softmask=False):
             # predict_img.save("examples/exp_{}.png".format(i))
         frame_one = frames[0]
         out_name = os.path.join(out_pth, "exp.gif")
-        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=200, loop=0) 
+        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=500, loop=0) 
 
         # ######################### view ###############################
         frames = []
@@ -155,7 +212,7 @@ def driven_by_flame_coefs(model, src_pth, out_pth, device, softmask=False):
 
         frame_one = frames[0]
         out_name = os.path.join(out_pth, "pose.gif")
-        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=200, loop=0) 
+        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=500, loop=0) 
 
 
         # ######################### Jaw pose ###############################
@@ -182,7 +239,7 @@ def driven_by_flame_coefs(model, src_pth, out_pth, device, softmask=False):
 
         frame_one = frames[0]
         out_name = os.path.join(out_pth, "jaw.gif")
-        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=200, loop=0) 
+        frame_one.save(out_name, format="GIF", append_images=frames, save_all=True, duration=500, loop=0) 
 
 def main(args):
     device = "cuda"
@@ -197,10 +254,20 @@ def main(args):
     model.load_state_dict(ckpt, strict=False)
     print(f'-- Number of parameters (G): {sum(p.numel() for p in model.parameters())/1e6} M\n')
 
-    if args.flame:
+    if args.mesh_driven and args.mesh_dir is not None:
+        driven_by_mesh(model, args.src_pth, args.save_dir, args.expname, args.mesh_dir, device, softmask=True) ###4 TODO: see what softmask does
+    elif args.flame:
         driven_by_flame_coefs(model, args.src_pth, args.out_pth, device, softmask=True)
     else:
         driven_by_face(model, args.src_pth, args.drv_pth, args.out_pth, device, softmask=True)
+    
+    # if args.save_images:
+    #     # Dimensions
+    #     height, width, channels = frame[0].shape
+    #     # Create video writer object
+    #     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Change codec if needed (e.g., 'XVID')
+    #     video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+    #     for frame in frames:
 
 
 if __name__ == '__main__':
@@ -208,8 +275,14 @@ if __name__ == '__main__':
     parser.add_argument('--src_pth', type=str, default="examples/1.png")
     parser.add_argument('--drv_pth', type=str, default="examples/2.png")
     parser.add_argument('--out_pth', type=str, default="examples/output.png")
+    parser.add_argument('--save_dir', type=str, default="results")
+    parser.add_argument('--expname', type=str, default="test")
     parser.add_argument('--ckpt_pth', type=str, default="data/cvthead.pt")
+    parser.add_argument('--mesh_driven', type=bool, default="False")
+    parser.add_argument('--mesh_dir', type=str, default="")
     parser.add_argument('--flame', action='store_true')
+    # parser.add_argument('--save_images', action='store_true')
+    # parser.add_argument('--save_video', action='store_true')
     args = parser.parse_args()
 
     main(args)

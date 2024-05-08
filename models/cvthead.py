@@ -476,3 +476,64 @@ class CVTHead(nn.Module):
         outputs["pred_drv_mask"] = pred_drv_mask        # (B, 1, H, W), [0,1]
         outputs["drv_depth_img"] = drv_depth_img        # visualization only
         return outputs
+    
+    
+    def get_mesh_metadata(self, crop_src_img, src_img):
+        with torch.no_grad():
+            # 0) pre-trained face segmentation (include hair + shoulder)
+            self.face_parsing.eval()        # !!!!
+
+            # source face mask
+            src_mask_gt, _ = self.face_parsing(src_img)    # (B, C=19, H, W) detach
+            src_mask = src_mask_gt.argmax(1)               # (B, H, W)
+            src_mask = (src_mask > 0 ) + 0          
+            src_mask = src_mask.unsqueeze(1).float()       # (B, 1, H, W)
+
+            # 1) DECA Encoder forward 
+            # src image
+            self.deca.eval()        # !!!!
+            src_codedict = self.deca.encode(crop_src_img, use_detail=False)   
+            src_outputs = self.deca.decode(src_codedict, rendering=False, vis_lmk=False, return_vis=False, use_detail=False)
+            src_verts = src_outputs["verts"]   # (B, V, 3) in canonical space
+            # pass # get metadata for the next function
+            return src_verts, src_codedict, src_mask
+
+    def generate_from_mesh(self, src_img, src_tform, src_verts, src_codedict, src_mask, drv_verts, hair_deform=True, pose=None):
+
+        b, _, H, W = src_img.shape       # (256, 256)
+        outputs = {}
+        outputs["src_mask_gt"] = src_mask
+        with torch.no_grad():         
+            # 2) Add deformation to driving image
+            if hair_deform:
+                vtx_deform = self.forward_vtx_deform(src_img)       # (B, V, 3)
+                src_verts_aug = src_verts + vtx_deform              # (B, V, 3) in canonical space, with hair and shoulder augmentation
+                drv_verts_aug = drv_verts + vtx_deform              # (B, V, 3) in canonical space, with hair and shoulder augmentation
+            else:
+                src_verts_aug = src_verts              # (B, V, 3) in canonical space without hair and shoulder augmentation
+                drv_verts_aug = drv_verts              # (B, V, 3) in canonical space without hair and shoulder augmentation 
+
+            # project vertices in canonical space to 2D image space
+            src_trans_verts_aug = self.verts_aug_transfer(src_verts_aug, src_codedict["cam"], src_tform, H, W)  # (B, V, 3), val: (u,v,d),[-1,1]
+            drv_trans_verts_aug = self.verts_aug_transfer(drv_verts_aug, src_codedict["cam"], src_tform, H, W)  # (B, V, 3)
+
+        # 3) Vertices Feature Transformer 
+        vtx_descriptor = self.foward_vtx_feat(src_img, src_mask, src_trans_verts_aug)  # (B, V=5023, C)
+
+        # 4) Projection for Driven Image 
+        drv_ind_img, _ = verts_to_proj_inds(drv_trans_verts_aug, H, W)      # (B, H, W), val: {0,1,..,V}
+        # Depth Image of driving
+        drv_depth_img = verts_feature_assign(drv_ind_img, drv_trans_verts_aug[:, :, 2:], pad_val=-2) # (B, 1, H, W)
+        # Vtx feature of driving
+        drv_vtx_feat_image = verts_feature_assign(drv_ind_img, vtx_descriptor, pad_val=0)            # (B, C, H, W)
+
+        # 5) U-Net rendering
+        x = torch.cat([drv_depth_img, drv_vtx_feat_image], dim=1)        # (B, 1+C, H, W)
+        pred_drv = self.unet_generator(x)
+        pred_drv_img = torch.tanh(pred_drv[:, :3, :, :])             # (B, 3, H=256, W=256), val: [-1, 1]
+        pred_drv_mask = torch.sigmoid(pred_drv[:, 3:, :, :])            # (B, 1, H=256, W=256), val: (0, 1)
+
+        outputs["pred_drv_img"] = pred_drv_img          # (B, 3, H, W), [-1,1]
+        outputs["pred_drv_mask"] = pred_drv_mask        # (B, 1, H, W), [0,1]
+        outputs["drv_depth_img"] = drv_depth_img        # visualization only
+        return outputs
